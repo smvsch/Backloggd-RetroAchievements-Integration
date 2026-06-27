@@ -9,7 +9,7 @@ Integrates RetroAchievements stats directly into Backloggd profiles and game pag
 
 - Uses a dedicated backend proxy to handle database communications, ensuring no secret keys are exposed in the client-side code and your data remains private.
 
-###How to Use:
+### How to Use:
 
 - Navigate to any game page on Backloggd.
 
