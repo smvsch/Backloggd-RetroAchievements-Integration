@@ -1,0 +1,296 @@
+// ==UserScript==
+// @name         Backloggd RetroAchievements Integration
+// @namespace    http://tampermonkey.net/
+// @version      7.0.0-Secure-Proxy
+// @description  Integrates RetroAchievements stats directly into Backloggd profiles and game pages.
+// @author       [smvsch]
+// @match        *://*.backloggd.com/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @run-at       document-end
+// @connect      retroachievements.org
+// @connect      vuycmvpcepeqwuujfsdu.supabase.co
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // ==================== CONFIGURATION ====================
+    const CONFIG = {
+        PROXY_URL: "https://vuycmvpcepeqwuujfsdu.supabase.co/functions/v1/proxy-handler"
+    };
+    // =======================================================
+
+    let lastUrl = window.location.href;
+
+    // --- REACIVE INJECTION LOGIC ---
+    function attemptInjection(retries = 10) {
+        if (retries <= 0) return;
+
+        const isGamePage = window.location.pathname.includes('/games/');
+        const isProfilePage = window.location.pathname.startsWith('/u/');
+
+        if (!isGamePage && !isProfilePage) return;
+        if (document.getElementById('ra-integration-card')) return;
+
+        let targetArea = document.querySelector('.row.mt-3') || document.querySelector('.card-body') || document.querySelector('main');
+
+        if (targetArea) {
+            const raContainer = document.createElement('div');
+            raContainer.id = 'ra-integration-card';
+            raContainer.style = 'background: #1c2025; border: 1px solid #2b3036; border-radius: 6px; margin: 20px 0; width: 100%; padding: 18px; font-family: inherit; box-sizing: border-box;';
+            targetArea.parentNode.insertBefore(raContainer, targetArea.nextSibling);
+
+            if (isProfilePage && getProfileOwner()) {
+                handleProfilePage(raContainer, getProfileOwner(), getLoggedUser());
+            } else if (isGamePage) {
+                handleGamePage(raContainer, getLoggedUser());
+            }
+        } else {
+            setTimeout(() => attemptInjection(retries - 1), 100);
+        }
+    }
+
+    function getLoggedUser() {
+        const userNav = document.querySelector('a.nav-link[href^="/u/"]');
+        return userNav ? userNav.getAttribute('href').split('/')[2] : null;
+    }
+
+    function getProfileOwner() {
+        const path = window.location.pathname;
+        return path.startsWith('/u/') ? path.split('/')[2] : null;
+    }
+
+    // ==================== ROUTE A: GAME TRACKING ====================
+    function handleGamePage(container, loggedUser) {
+        const titleElement = document.querySelector('h1') || document.querySelector('.game-page-title');
+        if (!titleElement) return;
+        const gameTitle = titleElement.innerText.trim();
+        const gamePathKey = "MANUAL_ID_" + window.location.pathname.replace(/\/games\//, '').replace(/\//g, '');
+
+        let RA_USER = GM_getValue("RA_USERNAME", "");
+        let RA_API_KEY = GM_getValue("RA_API_KEY", "");
+
+        if (!RA_USER || !RA_API_KEY) {
+            container.innerHTML = `
+                <div style="font-size: 12px; font-weight: 700; color: #9fa6af; letter-spacing: 0.8px; text-transform: uppercase; margin-bottom: 8px;">RetroAchievements Global Sync</div>
+                <p style="font-size: 12px; color: #9fa6af; margin: 0 0 12px 0;">Link your account once to publish your achievements to the community database seamlessly.</p>
+                <div style="display: flex; gap: 10px; max-width: 500px; margin-bottom: 10px;">
+                    <input type="text" id="ra-set-user" placeholder="RA Username" style="padding: 6px 12px; background: #111417; border: 1px solid #2b3036; color: #fff; border-radius: 4px; font-size: 12px; flex: 1;">
+                    <input type="password" id="ra-set-key" placeholder="Web API Key" style="padding: 6px 12px; background: #111417; border: 1px solid #2b3036; color: #fff; border-radius: 4px; font-size: 12px; flex: 1;">
+                    <button id="ra-save-btn" style="padding: 6px 16px; background: #e91e63; color: #fff; font-weight: 600; border: none; border-radius: 4px; cursor: pointer; font-size: 12px;">Link & Publish</button>
+                </div>
+                <div style="font-size: 11px;"><a href="https://retroachievements.org/controlpanel.php" target="_blank" style="color: #ff4081; text-decoration: none;">🔑 Get your Web API Key here (Keys section) ↗</a></div>
+            `;
+            document.getElementById('ra-save-btn').addEventListener('click', () => {
+                const user = document.getElementById('ra-set-user').value.trim();
+                const key = document.getElementById('ra-set-key').value.trim();
+                if (user && key && loggedUser) {
+                    GM_setValue("RA_USERNAME", user);
+                    GM_setValue("RA_API_KEY", key);
+                    publishToSupabase(loggedUser, user);
+                }
+            });
+            return;
+        }
+
+        container.innerHTML = `
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px;">
+                <div style="font-size: 12px; font-weight: 700; color: #9fa6af; letter-spacing: 0.8px; text-transform: uppercase;">RetroAchievements Progress</div>
+                <div style="display: flex; gap: 12px;">
+                    <button id="ra-override-btn" style="background:none; border:none; color:#9fa6af; cursor:pointer; font-size:11px; padding:0; text-decoration: underline;">Manual Link ID</button>
+                    <button id="ra-clear-btn" style="background:none; border:none; color:#ff4d4d; cursor:pointer; font-size:11px; padding:0; text-decoration: underline;">Unlink</button>
+                </div>
+            </div>
+            <div id="ra-content" style="font-size: 13px; color: #9fa6af;">Synchronizing achievement indexes...</div>
+        `;
+
+        document.getElementById('ra-clear-btn').addEventListener('click', () => { if(confirm("Disconnect account?")) { GM_setValue("RA_USERNAME", ""); GM_setValue("RA_API_KEY", ""); location.reload(); } });
+        document.getElementById('ra-override-btn').addEventListener('click', () => {
+            let currentManualId = GM_getValue(gamePathKey, "");
+            let manualId = prompt("Enter RetroAchievements Game ID manually:", currentManualId);
+            if (manualId !== null) { GM_setValue(gamePathKey, manualId.trim()); location.reload(); }
+        });
+
+        const progressUrl = `https://retroachievements.org/API/API_GetUserCompletionProgress.php?z=${RA_USER}&y=${RA_API_KEY}&u=${RA_USER}&c=500`;
+        fetchRAData(progressUrl, gameTitle, gamePathKey, RA_USER, RA_API_KEY);
+    }
+
+    // ==================== ROUTE B: SOCIAL PROFILES ====================
+    function handleProfilePage(container, profileOwner, loggedUser) {
+        container.innerHTML = `<div id="ra-content" style="font-size: 13px; color: #9fa6af;">Checking network database...</div>`;
+        fetchFromSupabase(profileOwner, (raUsername) => {
+            if (!raUsername) {
+                container.innerHTML = `<div style="font-size:12px; color:#6c757d; font-style:italic;">This user hasn't linked their RetroAchievements profile to the script network yet.</div>`;
+                return;
+            }
+            let MY_USER = GM_getValue("RA_USERNAME", "");
+            let MY_API_KEY = GM_getValue("RA_API_KEY", "");
+            if (!MY_USER || !MY_API_KEY) {
+                container.innerHTML = `<div style="font-size: 12px; font-weight: 700; color: #9fa6af; letter-spacing: 0.8px; text-transform: uppercase; margin-bottom: 4px;">RetroAchievements Profile</div><div style="font-size:12px; color:#9fa6af;">This profile maps to RA user <strong>${raUsername}</strong>. Link your own account on any game page to see their full arcade showcase stats here!</div>`;
+                return;
+            }
+            const summaryUrl = `https://retroachievements.org/API/API_GetUserSummary.php?z=${MY_USER}&y=${MY_API_KEY}&u=${raUsername}&g=0&a=0`;
+            GM_xmlhttpRequest({
+                method: "GET",
+                url: summaryUrl,
+                onload: function(res) {
+                    try {
+                        let data = JSON.parse(res.responseText);
+                        const points = data.Points || 0;
+                        const rank = data.Rank ? parseInt(data.Rank).toLocaleString() : "Unranked";
+                        const userPic = data.UserPic ? `https://media.retroachievements.org${data.UserPic}` : 'https://retroachievements.org/images/no_avatar.png';
+                        container.innerHTML = `
+                            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+                                <div style="font-size: 12px; font-weight: 700; color: #9fa6af; letter-spacing: 0.8px; text-transform: uppercase;">RetroAchievements Showcase</div>
+                                <a href="https://retroachievements.org/user/${raUsername}" target="_blank" style="color: #ff4081; text-decoration: none; font-size: 12px; font-weight: 600;">View Full Profile ↗</a>
+                            </div>
+                            <div style="display: flex; gap: 16px; align-items: center;">
+                                <img src="${userPic}" style="width: 54px; height: 54px; border-radius: 4px; border: 1px solid #2b3036; background: #111417;">
+                                <div style="display: flex; flex: 1; justify-content: space-around; background: #111417; border: 1px solid #2b3036; border-radius: 4px; padding: 10px;">
+                                    <div style="text-align: center;"><div style="font-size: 10px; text-transform: uppercase; color: #6c757d; font-weight: 700; letter-spacing: 0.5px;">RA Handle</div><div style="font-size: 14px; color: #fff; font-weight: 600;">${raUsername}</div></div>
+                                    <div style="text-align: center;"><div style="font-size: 10px; text-transform: uppercase; color: #6c757d; font-weight: 700; letter-spacing: 0.5px;">Score</div><div style="font-size: 14px; color: #ffb300; font-weight: 600;">Points: ${points.toLocaleString()}</div></div>
+                                    <div style="text-align: center;"><div style="font-size: 10px; text-transform: uppercase; color: #6c757d; font-weight: 700; letter-spacing: 0.5px;">Global Rank</div><div style="font-size: 14px; color: #26a65b; font-weight: 600;"># ${rank}</div></div>
+                                </div>
+                            </div>
+                        `;
+                    } catch(e) { container.innerHTML = `<div style="font-size:12px; color:#ff4d4d;">Failed to load user statistics panel.</div>`; }
+                }
+            });
+        });
+    }
+
+    // ==================== NETWORKING & ENGINE ====================
+    function publishToSupabase(backloggdUser, raUser) {
+        GM_xmlhttpRequest({
+            method: "POST",
+            url: `${CONFIG.PROXY_URL}/user_mappings`,
+            headers: { "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates" },
+            data: JSON.stringify({ backloggd_username: backloggdUser.toLowerCase(), ra_username: raUser }),
+            onload: function() { location.reload(); }
+        });
+    }
+
+    function fetchFromSupabase(backloggdUser, callback) {
+        GM_xmlhttpRequest({
+            method: "GET",
+            url: `${CONFIG.PROXY_URL}/user_mappings?backloggd_username=eq.${backloggdUser.toLowerCase()}&select=ra_username`,
+            onload: function(res) {
+                try { let data = JSON.parse(res.responseText); callback(data && data.length > 0 ? data[0].ra_username : null); } catch(e) { callback(null); }
+            }
+        });
+    }
+
+    function fetchRAData(url, gameTitle, gamePathKey, user, apiKey) {
+        GM_xmlhttpRequest({
+            method: "GET",
+            url: url,
+            onload: function(response) {
+                try {
+                    let parsed = JSON.parse(response.responseText.trim());
+                    let gamesArray = parsed && parsed.Results ? parsed.Results : (parsed && typeof parsed === 'object' ? Object.values(parsed) : []);
+                    let savedManualId = GM_getValue(gamePathKey, "");
+                    let match = savedManualId ? gamesArray.find(g => g && g.GameID && g.GameID.toString() === savedManualId) : gamesArray.find(g => g && g.Title && cleanTitle(g.Title) === cleanTitle(gameTitle));
+                    if (match || savedManualId) { fetchGameBadges(match ? match.GameID : savedManualId, user, apiKey, savedManualId ? true : false); } else { renderManualForm(gameTitle, gamePathKey); }
+                } catch (e) { document.getElementById('ra-content').innerHTML = `Local storage index array verification parsed offline.`; }
+            }
+        });
+    }
+
+    function fetchGameBadges(gameId, user, apiKey, isOverridden) {
+        GM_xmlhttpRequest({
+            method: "GET",
+            url: `https://retroachievements.org/API/API_GetGameInfoAndUserProgress.php?z=${user}&y=${apiKey}&u=${user}&g=${gameId}`,
+            onload: function(res) {
+                try { renderSteamStyleUI(JSON.parse(res.responseText), isOverridden); } catch(e) { document.getElementById('ra-content').innerHTML = `Failed loading target trophy rows.`; }
+            }
+        });
+    }
+
+    function cleanTitle(str) { return str.toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim(); }
+
+    function renderManualForm(gameTitle, gamePathKey) {
+        const container = document.getElementById('ra-content');
+        const searchUrl = `https://retroachievements.org/search?query=${encodeURIComponent(gameTitle)}`;
+
+        container.innerHTML = `
+            <div style="font-size: 13px; color: #9fa6af; margin-bottom: 10px;">
+                <strong>Auto-match failed.</strong> Link this game manually:
+            </div>
+            <div style="display: flex; gap: 8px; margin-bottom: 12px;">
+                <input type="text" id="ra-manual-input" placeholder="Paste ID (e.g. 1234)..."
+                    style="flex: 1; padding: 6px; background: #111417; border: 1px solid #2b3036; color: #fff; border-radius: 4px; font-size: 12px;">
+                <button id="ra-manual-save-btn" style="padding: 6px 12px; background: #e91e63; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 600;">Link ID</button>
+            </div>
+            <div style="font-size: 11px; color: #6c757d; line-height: 1.6;">
+                1. <a href="${searchUrl}" target="_blank" style="color: #ff4081; text-decoration: underline;">Search for "${gameTitle}" on RA</a><br>
+                2. Click your game from the search results.<br>
+                3. Copy the ID number from the URL address bar.<br>
+                4. Paste that ID above and click "Link ID".
+            </div>
+        `;
+
+        document.getElementById('ra-manual-save-btn').addEventListener('click', () => {
+            const inputId = document.getElementById('ra-manual-input').value.trim();
+            if(inputId) {
+                GM_setValue(gamePathKey, inputId);
+                location.reload();
+            }
+        });
+    }
+
+    function renderSteamStyleUI(gameData, isOverridden) {
+        const achList = Object.values(gameData.Achievements || {});
+        const maxAch = achList.length;
+        const unlockedList = achList.filter(a => a.DateEarned || a.DateEarnedHardcore);
+        const awarded = unlockedList.length;
+        const pct = maxAch > 0 ? ((awarded / maxAch) * 100).toFixed(1) : "0.0";
+        const mainColor = (maxAch > 0 && awarded === maxAch) ? '#26a65b' : '#e91e63';
+        let badgesToShow = [...unlockedList].sort((a, b) => new Date(b.DateEarnedHardcore || b.DateEarned || 0) - new Date(a.DateEarnedHardcore || a.DateEarned || 0));
+        if (badgesToShow.length < 6) badgesToShow = badgesToShow.concat(achList.filter(a => !a.DateEarned && !a.DateEarnedHardcore).slice(0, 6 - badgesToShow.length));
+        badgesToShow = badgesToShow.slice(0, 6);
+        let badgesHTML = '<div style="display: flex; gap: 10px; margin-top: 8px;">';
+        badgesToShow.forEach(ach => {
+            const isUnlocked = ach.DateEarned || ach.DateEarnedHardcore;
+            const imgStyle = isUnlocked ? 'width:100%; height:100%; object-fit:cover;' : 'width:100%; height:100%; object-fit:cover; filter:grayscale(1) opacity(0.35);';
+            badgesHTML += `<div style="position: relative; width: 44px; height: 44px; border-radius: 4px; overflow: hidden; border: 1px solid #2b3036; background: #111417;" title="${ach.Title}"><img src="https://media.retroachievements.org/Badge/${ach.BadgeName}.png" style="${imgStyle}"></div>`;
+        });
+        badgesHTML += '</div>';
+        document.getElementById('ra-content').innerHTML = `
+            <div style="display: grid; grid-template-columns: 1fr 240px; gap: 30px; align-items: center;">
+                <div>
+                    <div style="font-size: 15px; font-weight: 600; color: #fff;">${gameData.Title} <span style="font-size: 12px; color: #9fa6af; font-weight: normal;">(${gameData.ConsoleName || 'System'})</span></div>
+                    <div style="margin-top: 10px;"><div style="font-size: 11px; color: #6c757d; text-transform: uppercase;">Trophy Showcase</div>${badgesHTML}</div>
+                </div>
+                <div>
+                    <div style="display: flex; justify-content: space-between; font-size: 12px; color: #fff; font-weight: 600;"><span>Progress</span><span>${awarded}/${maxAch} (${pct}%)</span></div>
+                    <div style="background: #111417; border: 1px solid #2b3036; border-radius: 4px; height: 10px; width: 100%; overflow: hidden;"><div style="background: ${mainColor}; height: 100%; width: ${pct}%;"></div></div>
+                </div>
+            </div>`;
+    }
+
+    function init() {
+        lastUrl = window.location.href;
+        attemptInjection(20);
+    }
+
+    window.addEventListener('popstate', () => {
+        setTimeout(init, 500);
+    });
+
+    const originalPushState = history.pushState;
+    history.pushState = function(...args) {
+        originalPushState.apply(this, args);
+        setTimeout(init, 500);
+    };
+
+    const observer = new MutationObserver(() => {
+        if (location.href !== lastUrl) {
+            init();
+        }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    init();
+})();
